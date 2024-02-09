@@ -15,7 +15,7 @@ class BinutilsBuilder(Builder):
     def __init__(self) -> None:
         super().__init__()
 
-        self.cflags: list[str] = ['-O2']
+        self.cflags: list[str] = ['-O3']
         self.configure_flags: tc_build.utils.CmdList = [
             '--disable-compressed-debug-sections',
             '--disable-gdb',
