@@ -38,8 +38,8 @@ send_msg "gh $RUN_NUM: building LLVM"
     --shallow-clone \
     --targets AArch64 ARM X86 \
     --lto thin \
-    --clang-vendor-string "Geopelia" \
-    --lld-vendor-string "Gino"
+    --clang-vendor-string "Apricot" \
+    --lld-vendor-string "DEvolution"
 
 # Check if the final clang binary exists or not
 for file in install/bin/clang-[1-9]*; do
@@ -85,8 +85,8 @@ popd || exit
 llvm_commit_url="https://github.com/llvm/llvm-project/commit/$short_llvm_commit"
 clang_version="$("$HOME_DIR"/install/bin/clang --version | head -n1 | cut -d' ' -f4)"
 build_date="$(TZ=Asia/Ho_Chi_Minh date +"%Y-%m-%d")"
-tags="Geopelia-Clang-$clang_version"
-file="Geopelia-Clang-$clang_version.tar.gz"
+tags="Apricot-Clang-$clang_version"
+file="Apricot-Clang-$clang_version.tar.gz"
 
 # Get binutils version
 binutils_version=$(grep "LATEST_BINUTILS_RELEASE" build-binutils.py)
