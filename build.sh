@@ -38,6 +38,7 @@ send_msg "gh $RUN_NUM: building LLVM"
     --shallow-clone \
     --targets AArch64 ARM \
     --lto thin \
+    --pgo kernel-defconfig-slim \
     --clang-vendor-string "Tsukuyomi" \
     --lld-vendor-string "Kassen"
 
