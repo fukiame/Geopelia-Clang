@@ -6,7 +6,7 @@ on:
       BRANCH:
         description: 'LLVM branch'
         required: true
-        default: 'main'
+        default: 'release/14.x'
 
 env:
   BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
