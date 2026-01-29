@@ -39,8 +39,8 @@ send_msg "gh $RUN_NUM: building LLVM"
     --targets AArch64 ARM X86 \
     --lto thin \
     --pgo kernel-defconfig-slim \
-    --clang-vendor-string "Geopelia" \
-    --lld-vendor-string "Gino"
+    --clang-vendor-string "Fleurix" \
+    --lld-vendor-string "kuroyuki"
 
 # Check if the final clang binary exists or not
 for file in install/bin/clang-[1-9]*; do
