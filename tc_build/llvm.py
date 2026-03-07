@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import contextlib
 import os
 from pathlib import Path
 import platform
@@ -10,9 +9,11 @@ import subprocess
 import time
 
 from tc_build.builder import Builder
+from tc_build.source import GitSourceManager
 import tc_build.utils
 
 LLVM_VER_FOR_RUNTIMES = 20
+VALID_DISTRIBUTION_PROFILES = ('none', 'bootstrap', 'kernel', 'rust')
 
 
 def get_all_targets(llvm_folder, experimental=False):
@@ -57,6 +58,7 @@ class LLVMBuilder(Builder):
             # it and limits optimization opportunities for LTO, PGO, and BOLT.
             'LLVM_LINK_LLVM_DYLIB': 'OFF',
         }
+        self.distribution_profile = 'none'
         self.install_targets = []
         self.llvm_major_version = 0
         self.tools = None
@@ -74,17 +76,18 @@ class LLVMBuilder(Builder):
 
         tc_build.utils.print_header(f"Performing BOLT with {mode}")
 
-        # clang-#: original binary
-        # clang.bolt: BOLT optimized binary
+        # real_binary: clang-# or llvm (if multicall is enabled)
+        # bolt_binary: clang.bolt or llvm.bolt
         # .bolt will become original binary after optimization
-        clang = Path(self.folders.build, 'bin/clang').resolve()
-        clang_bolt = clang.with_name('clang.bolt')
+        real_binary = Path(self.folders.build, 'bin/clang').resolve()
+        binary_prefix = 'llvm' if self.multicall_is_enabled() else 'clang'
+        bolt_binary = real_binary.with_name(f"{binary_prefix}.bolt")
 
-        bolt_profile = Path(self.folders.build, 'clang.fdata')
+        bolt_profile = Path(self.folders.build, f"{binary_prefix}.fdata")
 
         if mode == 'instrumentation':
-            # clang.inst: instrumented binary, will be removed after generating profiles
-            clang_inst = clang.with_name('clang.inst')
+            # clang.inst / llvm.inst: instrumented binary, will be removed after generating profiles
+            inst_binary = real_binary.with_name(f"{binary_prefix}.inst")
 
             clang_inst_cmd = [
                 self.tools.llvm_bolt,
@@ -92,8 +95,8 @@ class LLVMBuilder(Builder):
                 f"--instrumentation-file={bolt_profile}",
                 '--instrumentation-file-append-pid',
                 '-o',
-                clang_inst,
-                clang,
+                inst_binary,
+                real_binary,
             ]
             # When running an instrumented binary on certain platforms (namely
             # Apple Silicon), there may be hangs due to instrumentation in
@@ -104,7 +107,18 @@ class LLVMBuilder(Builder):
                 clang_inst_cmd.append('--conservative-instrumentation')
             self.run_cmd(clang_inst_cmd)
 
-            self.bolt_builder.bolt_instrumentation = True
+            if binary_prefix == 'llvm':
+                # The multicall tools are all symlinked to the 'llvm' binary.
+                # To avoid having to mess with those symlinks, perform a
+                # shuffle of the real binary with the instrumented binary for
+                # the build process.
+                orig_binary = real_binary.with_name('llvm.orig')
+                real_binary.replace(orig_binary)  # mv llvm llvm.orig
+                inst_binary.replace(real_binary)  # mv llvm.inst llvm
+            else:
+                # This option changes CC when building Linux, which is only
+                # needed when just clang is instrumented.
+                self.bolt_builder.bolt_instrumentation = True
 
         if mode == 'sampling':
             self.bolt_builder.bolt_sampling_output = Path(self.folders.build, 'perf.data')
@@ -115,6 +129,11 @@ class LLVMBuilder(Builder):
         # With instrumentation, we need to combine the profiles we generated,
         # as they are separated by PID
         if mode == 'instrumentation':
+            # Undo shuffle from above
+            if binary_prefix == 'llvm':
+                real_binary.replace(inst_binary)  # mv llvm llvm.inst
+                orig_binary.replace(real_binary)  # mv llvm.orig llvm
+
             fdata_files = bolt_profile.parent.glob(f"{bolt_profile.name}.*.fdata")
 
             # merge-fdata will print one line for each .fdata it merges.
@@ -139,7 +158,7 @@ class LLVMBuilder(Builder):
                 self.bolt_builder.bolt_sampling_output,
                 '-o',
                 bolt_profile,
-                clang,
+                real_binary,
             ]
             self.run_cmd(perf2bolt_cmd)
             self.bolt_builder.bolt_sampling_output.unlink()
@@ -166,18 +185,18 @@ class LLVMBuilder(Builder):
             '--dyno-stats',
             f"--icf={icf_val}",
             '-o',
-            clang_bolt,
+            bolt_binary,
             f"--reorder-blocks={'cache+' if use_cache_plus else 'ext-tsp'}",
             f"--reorder-functions={reorder_funcs_val}",
             '--split-all-cold',
             f"--split-functions{'=3' if use_sf_val else ''}",
             '--use-gnu-stack',
-            clang,
+            real_binary,
         ]
         self.run_cmd(clang_opt_cmd)
-        clang_bolt.replace(clang)
+        bolt_binary.replace(real_binary)
         if mode == 'instrumentation':
-            clang_inst.unlink()
+            inst_binary.unlink()
 
     def build(self):
         if not self.folders.build:
@@ -273,16 +292,6 @@ class LLVMBuilder(Builder):
 
         if self.tools.ar:
             self.cmake_defines['CMAKE_AR'] = self.tools.ar
-        # Utilize thin archives to save space. Use the deprecated -T for
-        # compatibility with binutils<2.38 and llvm-ar<14. Unfortunately, thin
-        # archives make compiler-rt archives not easily distributable, so we
-        # disable the optimization when compiler-rt is enabled and there is an
-        # install directory. Ideally thin archives should still be usable for
-        # non-compiler-rt projects.
-        if not (self.folders.install and self.project_is_enabled('compiler-rt')):
-            self.cmake_defines['CMAKE_CXX_ARCHIVE_CREATE'] = '<CMAKE_AR> DqcT <TARGET> <OBJECTS>'
-        self.cmake_defines['CMAKE_CXX_ARCHIVE_FINISH'] = 'true'
-
         if self.tools.ranlib:
             self.cmake_defines['CMAKE_RANLIB'] = self.tools.ranlib
         if 'CMAKE_BUILD_TYPE' not in self.cmake_defines:
@@ -363,10 +372,107 @@ class LLVMBuilder(Builder):
                                                    text=True).stdout.strip()
             self.cmake_defines['LLVM_DEFAULT_TARGET_TRIPLE'] = default_target_triple
 
+        self.handle_distribution_profile()
+
         cmake_cmd += [f'-D{key}={self.cmake_defines[key]}' for key in sorted(self.cmake_defines)]
 
         self.clean_build_folder()
         self.run_cmd(cmake_cmd)
+
+    def handle_distribution_profile(self):
+        if self.distribution_profile == 'none':
+            return
+        if self.distribution_profile not in VALID_DISTRIBUTION_PROFILES:
+            raise RuntimeError(f"Unknown distribution profile: {self.distribution_profile}")
+
+        self.set_llvm_major_version()
+
+        llvm_build_runtime = self.cmake_defines.get('LLVM_BUILD_RUNTIME', 'ON') == 'ON'
+        build_compiler_rt = self.project_is_enabled('compiler-rt') and llvm_build_runtime
+        llvm_build_tools = self.cmake_defines.get('LLVM_BUILD_TOOLS', 'ON') == 'ON'
+
+        distribution_components = []
+        runtime_distribution_components = []
+
+        # There are two distribution profiles.
+        # bootstrap: Used for stage one to build the rest of LLVM
+        # kernel: All tools used to build the kernel
+        # rust: All tools, libraries, and headers needed to build Rust
+        # For the most part, bootstrap is a subset of kernel, aside from the
+        # tools and libraries for building an instrumented compiler.
+        # rust is a superset of kernel for ease of implementation.
+        if self.distribution_profile == 'rust':
+            distribution_components += [
+                'llvm-config',
+                'llvm-headers',
+                'llvm-libraries',
+            ]
+        if llvm_build_tools:
+            distribution_components += [
+                'llvm-ar',
+                'llvm-ranlib',
+            ]
+            if self.distribution_profile in ('kernel', 'rust'):
+                distribution_components += [
+                    'llvm-nm',
+                    'llvm-objcopy',
+                    'llvm-objdump',
+                    'llvm-readelf',
+                    'llvm-strip',
+                ]
+            if self.distribution_profile == 'rust':
+                distribution_components += [
+                    'llc',
+                    'llvm-as',
+                    'llvm-cov',
+                    'llvm-dis',
+                    'llvm-link',
+                    'llvm-size',
+                    'opt',
+                ]
+            # If multicall is enabled, we need to add all possible tools to the
+            # distribution components list to prevent them from being built as
+            # standalone tools, which may break the build for tools like
+            # llvm-symbolizer because they need LLVMDebuginfod but it is not
+            # linked in that configuration. While this does build a little more
+            # code for the 'distribution' target, it should result in only a
+            # slight increase in installation size due to being a multicall
+            # binary.
+            if self.multicall_is_enabled():
+                distribution_components += [
+                    item for item in self.llvm_driver_binaries('llvm')
+                    if item not in distribution_components
+                ]
+        if self.project_is_enabled('bolt'):
+            distribution_components.append('bolt')
+        if self.project_is_enabled('clang'):
+            distribution_components += ['clang', 'clang-resource-headers']
+            if self.multicall_is_enabled():
+                distribution_components += [
+                    item for item in self.llvm_driver_binaries('clang')
+                    if item not in distribution_components
+                ]
+        if self.project_is_enabled('lld'):
+            distribution_components.append('lld')
+
+        if self.distribution_profile in ('bootstrap', 'rust'):
+            distribution_components.append('llvm-profdata')
+
+        if self.distribution_profile == 'bootstrap' and build_compiler_rt:
+            if self.llvm_major_version >= LLVM_VER_FOR_RUNTIMES:
+                distribution_components.append('runtimes')
+                runtime_distribution_components.append('profile')
+            else:
+                distribution_components.append('profile')
+
+        if self.distribution_profile == 'rust' and self.project_is_enabled('polly'):
+            distribution_components.append('PollyISL')
+
+        if distribution_components:
+            self.cmake_defines['LLVM_DISTRIBUTION_COMPONENTS'] = ';'.join(distribution_components)
+        if runtime_distribution_components:
+            self.cmake_defines['LLVM_RUNTIME_DISTRIBUTION_COMPONENTS'] = ';'.join(
+                runtime_distribution_components)
 
     def host_target(self):
         uname_to_llvm = {
@@ -387,6 +493,26 @@ class LLVMBuilder(Builder):
 
     def host_target_is_enabled(self):
         return 'all' in self.targets or self.host_target() in self.targets
+
+    def llvm_driver_binaries(self, project):
+        # Find all CMakeLists.txt for LLVM or clang tools that have multicall driver support
+        cmakelists_txts = [
+            cmakelists_txt
+            for path in Path(self.folders.source, project).glob('tools/*/CMakeLists.txt')
+            if '  GENERATE_DRIVER' in (cmakelists_txt := path.read_text(encoding='utf-8'))
+        ]
+        skip_tools = (
+            # llvm-mt depends on libxml2, which we explicitly do not link against
+            'llvm-mt', )
+        # Return the values of the add_clang_tool() or add_llvm_tool() CMake macros
+        return [
+            tool for cmakelists_txt in cmakelists_txts
+            if (match := re.search(r"^add_(?:clang|llvm)_tool\((.*)$", cmakelists_txt, flags=re.M))
+            and (tool := match.groups()[0]) not in skip_tools
+        ]
+
+    def multicall_is_enabled(self):
+        return self.cmake_defines.get('LLVM_TOOL_LLVM_DRIVER_BUILD', 'OFF') == 'ON'
 
     def project_is_enabled(self, project):
         return 'all' in self.projects or project in self.projects
@@ -454,6 +580,11 @@ class LLVMBuilder(Builder):
 
 class LLVMSlimBuilder(LLVMBuilder):
 
+    def __init__(self):
+        super().__init__()
+
+        self.distribution_profile = 'kernel'
+
     def configure(self):
         # yapf: disable
         slim_clang_defines = {
@@ -476,42 +607,7 @@ class LLVMSlimBuilder(LLVMBuilder):
         if arcmt_cmakelists.exists():
             slim_clang_defines['CLANG_ENABLE_ARCMT'] = 'OFF'
 
-        llvm_build_runtime = self.cmake_defines.get('LLVM_BUILD_RUNTIME', 'ON') == 'ON'
-        build_compiler_rt = self.project_is_enabled('compiler-rt') and llvm_build_runtime
-
-        llvm_build_tools = self.cmake_defines.get('LLVM_BUILD_TOOLS', 'ON') == 'ON'
-
-        self.set_llvm_major_version()
-
-        distribution_components = []
-        runtime_distribution_components = []
-        if llvm_build_tools:
-            distribution_components += [
-                'llvm-ar',
-                'llvm-nm',
-                'llvm-objcopy',
-                'llvm-objdump',
-                'llvm-ranlib',
-                'llvm-readelf',
-                'llvm-strip',
-            ]
-        if self.project_is_enabled('bolt'):
-            distribution_components.append('bolt')
-        if self.project_is_enabled('clang'):
-            distribution_components += ['clang', 'clang-resource-headers']
-        if self.project_is_enabled('lld'):
-            distribution_components.append('lld')
-        if build_compiler_rt:
-            distribution_components.append('llvm-profdata')
-            if self.llvm_major_version >= LLVM_VER_FOR_RUNTIMES:
-                distribution_components.append('runtimes')
-                runtime_distribution_components.append('profile')
-            else:
-                distribution_components.append('profile')
-
         slim_llvm_defines = {
-            # Tools needed by bootstrapping
-            'LLVM_DISTRIBUTION_COMPONENTS': ';'.join(distribution_components),
             # Don't build bindings; they are for other languages that the kernel does not use
             'LLVM_ENABLE_BINDINGS': 'OFF',
             # Don't build Ocaml documentation
@@ -523,8 +619,6 @@ class LLVMSlimBuilder(LLVMBuilder):
             # Don't include example build targets to save on cmake cycles
             'LLVM_INCLUDE_EXAMPLES': 'OFF',
         }
-        if runtime_distribution_components:
-            slim_llvm_defines['LLVM_RUNTIME_DISTRIBUTION_COMPONENTS'] = ';'.join(runtime_distribution_components)
 
         slim_compiler_rt_defines = {
             # Don't build libfuzzer when compiler-rt is enabled, it invokes cmake again and we don't use it
@@ -539,6 +633,10 @@ class LLVMSlimBuilder(LLVMBuilder):
         self.cmake_defines.update(slim_llvm_defines)
         if self.project_is_enabled('clang'):
             self.cmake_defines.update(slim_clang_defines)
+
+        llvm_build_runtime = self.cmake_defines.get('LLVM_BUILD_RUNTIME', 'ON') == 'ON'
+        build_compiler_rt = self.project_is_enabled('compiler-rt') and llvm_build_runtime
+
         if build_compiler_rt:
             self.cmake_defines.update(slim_compiler_rt_defines)
 
@@ -550,6 +648,7 @@ class LLVMBootstrapBuilder(LLVMSlimBuilder):
     def __init__(self):
         super().__init__()
 
+        self.distribution_profile = 'bootstrap'
         self.projects = ['clang', 'lld']
         self.targets = ['host']
 
@@ -573,16 +672,18 @@ class LLVMInstrumentedBuilder(LLVMBuilder):
 
         self.cmake_defines['LLVM_BUILD_INSTRUMENTED'] = 'IR'
         self.cmake_defines['LLVM_BUILD_RUNTIME'] = 'OFF'
-        self.cmake_defines['LLVM_LINK_LLVM_DYLIB'] = 'ON'
 
     def configure(self):
+        no_multicall = not self.multicall_is_enabled()
         # The following defines are needed to avoid thousands of warnings
         # along the lines of:
         # "Unable to track new values: Running out of static counters."
-        # They require LLVM_LINK_DYLIB to be enabled, which is done above.
+        # LLVM_VP_COUNTERS_PER_SITE requires LLVM_LINK_DYLIB, which is only
+        # done when multicall is not enabled. If multicall is enabled, we need
+        # to use CMAKE_C{,XX}_FLAGS.
         cmake_options = Path(self.folders.source, 'llvm/cmake/modules/HandleLLVMOptions.cmake')
         cmake_text = cmake_options.read_text(encoding='utf-8')
-        if 'LLVM_VP_COUNTERS_PER_SITE' in cmake_text:
+        if no_multicall and 'LLVM_VP_COUNTERS_PER_SITE' in cmake_text:
             self.cmake_defines['LLVM_VP_COUNTERS_PER_SITE'] = '6'
         else:
             cflags = []
@@ -605,6 +706,13 @@ class LLVMInstrumentedBuilder(LLVMBuilder):
             self.cmake_defines['CMAKE_C_FLAGS'] = ' '.join(cflags)
             self.cmake_defines['CMAKE_CXX_FLAGS'] = ' '.join(cxxflags)
 
+        # These are currently incompatible:
+        # https://github.com/llvm/llvm-project/pull/133596
+        # But that should not matter much in this case because multicall uses
+        # much less disk space.
+        if no_multicall:
+            self.cmake_defines['LLVM_LINK_LLVM_DYLIB'] = 'ON'
+
         super().configure()
 
     def generate_profdata(self):
@@ -625,10 +733,13 @@ class LLVMSlimInstrumentedBuilder(LLVMInstrumentedBuilder, LLVMSlimBuilder):
     pass
 
 
-class LLVMSourceManager:
+class LLVMSourceManager(GitSourceManager):
 
     def __init__(self, repo):
-        self.repo = repo
+        super().__init__(repo)
+
+        self._pretty_name = 'LLVM'
+        self._repo_url = 'https://github.com/llvm/llvm-project.git'
 
     def default_projects(self):
         return ['clang', 'compiler-rt', 'lld', 'polly']
@@ -644,57 +755,3 @@ class LLVMSourceManager:
             targets.append('LoongArch')
 
         return targets
-
-    def download(self, ref, shallow=False):
-        if self.repo.exists():
-            return
-
-        tc_build.utils.print_header('Downloading LLVM')
-
-        git_clone = ['git', 'clone']
-        if shallow:
-            git_clone.append('--depth=1')
-            if ref != 'main':
-                git_clone.append('--no-single-branch')
-        git_clone += ['https://github.com/llvm/llvm-project', self.repo]
-
-        subprocess.run(git_clone, check=True)
-
-        self.git(['checkout', ref])
-
-    def git(self, cmd, capture_output=False):
-        return subprocess.run(['git', *cmd],
-                              capture_output=capture_output,
-                              check=True,
-                              cwd=self.repo,
-                              text=True)
-
-    def git_capture(self, cmd):
-        return self.git(cmd, capture_output=True).stdout.strip()
-
-    def is_shallow(self):
-        git_dir = self.git_capture(['rev-parse', '--git-dir'])
-        return Path(git_dir, 'shallow').exists()
-
-    def ref_exists(self, ref):
-        try:
-            self.git(['show-branch', ref])
-        except subprocess.CalledProcessError:
-            return False
-        return True
-
-    def update(self, ref):
-        tc_build.utils.print_header('Updating LLVM')
-
-        self.git(['fetch', 'origin'])
-
-        if self.is_shallow() and not self.ref_exists(ref):
-            raise RuntimeError(f"Repo is shallow and supplied ref ('{ref}') does not exist!")
-
-        self.git(['checkout', ref])
-
-        local_ref = None
-        with contextlib.suppress(subprocess.CalledProcessError):
-            local_ref = self.git_capture(['symbolic-ref', '-q', 'HEAD'])
-        if local_ref and local_ref.startswith('refs/heads/'):
-            self.git(['pull', '--rebase', 'origin', local_ref.replace('refs/heads/', '')])

@@ -9,7 +9,7 @@ import time
 
 import tc_build.utils
 
-from tc_build.llvm import LLVMBootstrapBuilder, LLVMBuilder, LLVMInstrumentedBuilder, LLVMSlimBuilder, LLVMSlimInstrumentedBuilder, LLVMSourceManager
+from tc_build.llvm import LLVMBootstrapBuilder, LLVMBuilder, LLVMInstrumentedBuilder, LLVMSlimBuilder, LLVMSlimInstrumentedBuilder, LLVMSourceManager, VALID_DISTRIBUTION_PROFILES
 from tc_build.kernel import KernelBuilder, LinuxSourceManager, LLVMKernelBuilder
 from tc_build.tools import HostTools, StageTools
 
@@ -22,10 +22,10 @@ except ImportError:
     BOOL_ARGS = {'action': 'store_true'}
 
 # This is a known good revision of LLVM for building the kernel
-GOOD_REVISION = '81c5d468cf00d6e41112fba6c89d6c40013bcbda'
+GOOD_REVISION = '2a2a394215b38631588d504d2b671df13370395b'
 
 # The version of the Linux kernel that the script downloads if necessary
-DEFAULT_KERNEL_FOR_PGO = (6, 18, 0)
+DEFAULT_KERNEL_FOR_PGO = (6, 19, 0)
 
 parser = ArgumentParser(formatter_class=RawTextHelpFormatter)
 clone_options = parser.add_mutually_exclusive_group()
@@ -158,6 +158,28 @@ parser.add_argument('-D',
 
                     '''),
                     nargs='+')
+parser.add_argument('--distribution-profile',
+                    help=textwrap.dedent('''\
+                    Smartly set value of LLVM_DISTRIBUTION_COMPONENTS for final build stage. Use in
+                    combination with
+
+                            --build-targets distribution
+                            --install-targets distribution
+
+                    to generate a smaller toolchain installation.
+
+                    Accepts the following values:
+
+                        none      - do not set LLVM_DISTRIBUTION_COMPONENTS at all
+                        bootstrap - components needed to build LLVM itself
+                        kernel    - components needed to build the Linux kernel
+                        rust      - components needed to build the Rust toolchain via build-rust.py
+
+                    The default is 'none' when '--full-toolchain' is enabled, 'kernel' if not.
+
+                    '''),
+                    type=str,
+                    choices=VALID_DISTRIBUTION_PROFILES)
 parser.add_argument('-f',
                     '--full-toolchain',
                     help=textwrap.dedent('''\
@@ -201,7 +223,7 @@ parser.add_argument('-l',
                     By default, the script will clone the llvm-project into the tc-build repo. If you have
                     another LLVM checkout that you would like to work out of, pass it to this parameter.
                     This can either be an absolute or relative path. Implies '--no-update'. When this
-                    option is supplied, '--ref' and '--use-good-revison' do nothing, as the script does
+                    option is supplied, '--ref' and '--use-good-revision' do nothing, as the script does
                     not manipulate a repository it does not own.
 
                     '''),
@@ -236,6 +258,14 @@ parser.add_argument('--lto',
                     '''),
                     type=str,
                     choices=['thin', 'full'])
+parser.add_argument('-m',
+                    '--multicall',
+                    help=textwrap.dedent('''\
+                    Build LLVM as a multicall binary via the LLVM_TOOL_LLVM_DRIVER_BUILD CMake option.
+                    This results in a much smaller installation on disk.
+
+                    '''),
+                    action='store_true')
 parser.add_argument('-n',
                     '--no-update',
                     help=textwrap.dedent('''\
@@ -544,6 +574,8 @@ if args.clang_vendor_string:
     common_cmake_defines['CLANG_VENDOR'] = args.clang_vendor_string
 if args.lld_vendor_string:
     common_cmake_defines['LLD_VENDOR'] = args.lld_vendor_string
+if args.multicall:
+    common_cmake_defines['LLVM_TOOL_LLVM_DRIVER_BUILD'] = 'ON'
 if args.defines:
     defines = dict(define.split('=', 1) for define in args.defines)
     common_cmake_defines.update(defines)
@@ -688,6 +720,8 @@ if args.pgo:
 final.build_targets = args.build_targets
 final.check_targets = args.check_targets
 final.cmake_defines.update(common_cmake_defines)
+if args.distribution_profile:
+    final.distribution_profile = args.distribution_profile
 final.folders.build = Path(build_folder, 'final')
 final.folders.install = Path(args.install_folder).resolve() if args.install_folder else None
 final.install_targets = args.install_targets
